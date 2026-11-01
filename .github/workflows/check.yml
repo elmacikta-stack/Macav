@@ -1,0 +1,213 @@
+name: Kanalları kontrol et ve yayımla
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [index.html, .github/workflows/check.yml]
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  website:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/configure-pages@v5
+
+      - name: Kontrol araçlarını kur
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          npm install --prefix "$RUNNER_TEMP/macav-checker" --no-save --no-package-lock --ignore-scripts iptv-checker@0.30.3
+
+      - name: Kanalları kontrol et
+        run: |
+          cat > "$RUNNER_TEMP/macav-checker/check.mjs" <<'NODE'
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+          import { IPTVChecker } from 'iptv-checker';
+
+          const root = process.env.GITHUB_WORKSPACE;
+
+          const html = await fs.readFile(
+            path.join(root, 'index.html'),
+            'utf8'
+          );
+
+          const block = html.match(
+            /<script id="channels-data" type="application\/json">([\s\S]*?)<\/script>/
+          );
+
+          if (!block) throw Error('Kanal listesi bulunamadı.');
+
+          const channels = JSON.parse(block[1]);
+
+          if (
+            !Array.isArray(channels) ||
+            !channels.length ||
+            channels.length > 40
+          ) {
+            throw Error('Kanal listesi 1–40 kayıt içermeli.');
+          }
+
+          const ids = new Set();
+
+          for (const c of channels) {
+            if (
+              !c ||
+              !/^[a-z0-9-]{1,50}$/.test(c.id) ||
+              typeof c.name !== 'string' ||
+              !c.name ||
+              typeof c.url !== 'string' ||
+              ids.has(c.id)
+            ) {
+              throw Error('Geçersiz kanal kaydı.');
+            }
+
+            const url = new URL(c.url);
+
+            if (
+              url.protocol !== 'https:' ||
+              url.username ||
+              url.password ||
+              !/^https:\/\/[A-Za-z0-9._~:/?&=+,%@!-]+$/.test(c.url)
+            ) {
+              throw Error(
+                'Kontrol listesinde yalnız sabit HTTPS adresleri kullanılabilir.'
+              );
+            }
+
+            ids.add(c.id);
+          }
+
+          const checker = new IPTVChecker({
+            timeout: 12000,
+            retry: 0,
+            delay: 0,
+            debug: false
+          });
+
+          const results = [];
+
+          for (const c of channels) {
+            let status;
+
+            try {
+              const response = await fetch(c.url, {
+                signal: AbortSignal.timeout(12000)
+              });
+
+              await response.body?.cancel();
+
+              if (!response.ok) {
+                throw Error('HTTP ' + response.status);
+              }
+
+              if (new URL(response.url).protocol !== 'https:') {
+                throw Error('Kaynak HTTPS dışına yönlendirdi.');
+              }
+
+              const result = await checker.checkStream({
+                url: c.url
+              });
+
+              status = result.status;
+            } catch (error) {
+              status = {
+                ok: false,
+                code: 'CHECK_ERROR',
+                message: String(error.message)
+              };
+            }
+
+            const streams = status?.metadata?.streams || [];
+            const video = streams.find(
+              s => s.codec_type === 'video'
+            );
+            const audio = streams.find(
+              s => s.codec_type === 'audio'
+            );
+
+            const ok = Boolean(status?.ok && video);
+
+            results.push({
+              id: c.id,
+              name: c.name,
+              url: c.url,
+              checkedAt: new Date().toISOString(),
+              status: ok ? 'ok' : 'failed',
+              code: ok
+                ? 'OK'
+                : status?.ok
+                  ? 'NO_VIDEO'
+                  : status?.code || 'UNKNOWN',
+              message: ok
+                ? ''
+                : String(
+                    status?.message ||
+                    'Video bilgisi alınamadı.'
+                  ).slice(0, 200),
+              videoCodec: video?.codec_name || null,
+              audioCodec: audio?.codec_name || null,
+              width: video?.width || null,
+              height: video?.height || null
+            });
+
+            console.log(
+              c.id + ': ' + (ok ? 'ok' : 'failed')
+            );
+          }
+
+          const report = {
+            version: 1,
+            checkedAt: new Date().toISOString(),
+            checker: 'iptv-checker@0.30.3',
+            location:
+              'GitHub Actions; kontrol sunucusunun ülkesi doğrulanmadı.',
+            channels: results
+          };
+
+          const site = path.join(root, '_site');
+
+          await fs.mkdir(site, { recursive: true });
+
+          await fs.copyFile(
+            path.join(root, 'index.html'),
+            path.join(site, 'index.html')
+          );
+
+          await fs.writeFile(
+            path.join(site, 'checks.json'),
+            JSON.stringify(report, null, 2)
+          );
+          NODE
+
+          node "$RUNNER_TEMP/macav-checker/check.mjs"
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Yayımla
+        id: deployment
+        uses: actions/deploy-pages@v4
